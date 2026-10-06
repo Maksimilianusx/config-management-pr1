@@ -1,6 +1,7 @@
 import argparse
 import getpass
 import os
+import posixpath
 import shlex
 import socket
 import tkinter as tk
@@ -41,7 +42,7 @@ def parse_command(command_line):
 
 
 def parse_arguments():
-    """Получить параметры запуска программы."""
+    """Получить параметры запуска."""
     parser = argparse.ArgumentParser(
         description="Эмулятор оболочки ОС"
     )
@@ -68,13 +69,12 @@ def parse_arguments():
 
 
 class XmlLogger:
-    """XML-журнал событий выполнения команд."""
+    """XML-журнал выполнения команд."""
 
     def __init__(self, log_path):
         self.log_path = Path(log_path)
 
     def load_tree(self):
-        """Загрузить существующий XML или создать новый."""
         if not self.log_path.exists():
             root = ET.Element("log")
             return ET.ElementTree(root)
@@ -86,7 +86,6 @@ class XmlLogger:
             return ET.ElementTree(root)
 
     def write(self, command, error=""):
-        """Записать событие в XML."""
         self.log_path.parent.mkdir(
             parents=True,
             exist_ok=True,
@@ -135,9 +134,10 @@ class VirtualFileSystem:
     def __init__(self, zip_path):
         self.zip_path = zip_path
         self.files = {}
+        self.directories = {"/"}
 
     def load(self):
-        """Загрузить файлы ZIP в память."""
+        """Загрузить VFS в память."""
         if not self.zip_path:
             raise ValueError(
                 "путь к VFS не указан"
@@ -156,18 +156,102 @@ class VirtualFileSystem:
             ) from error
 
     def read_archive(self):
-        """Прочитать содержимое ZIP без распаковки."""
+        """Прочитать ZIP без распаковки."""
         with zipfile.ZipFile(
             self.zip_path,
             "r",
         ) as archive:
             for name in archive.namelist():
-                if name.endswith("/"):
+                clean_name = name.replace(
+                    "\\",
+                    "/",
+                ).strip("/")
+
+                if not clean_name:
                     continue
 
-                self.files[name] = archive.read(
-                    name
+                if name.endswith("/"):
+                    self.add_directories(
+                        clean_name
+                    )
+                    continue
+
+                self.files[
+                    "/" + clean_name
+                ] = archive.read(name)
+
+                parent = posixpath.dirname(
+                    "/" + clean_name
                 )
+
+                self.add_directories(
+                    parent
+                )
+
+    def add_directories(self, path):
+        """Добавить директории в список VFS."""
+        path = "/" + path.strip("/")
+
+        while path not in ("", "/"):
+            self.directories.add(path)
+            path = posixpath.dirname(path)
+
+        self.directories.add("/")
+
+    def normalize_path(self, current_dir, path):
+        """Получить абсолютный путь внутри VFS."""
+        if not path:
+            return current_dir
+
+        if path.startswith("/"):
+            result = posixpath.normpath(path)
+        else:
+            result = posixpath.normpath(
+                posixpath.join(
+                    current_dir,
+                    path,
+                )
+            )
+
+        if not result.startswith("/"):
+            result = "/" + result
+
+        return result
+
+    def list_directory(self, directory):
+        """Получить содержимое каталога."""
+        if directory not in self.directories:
+            raise ValueError(
+                f"каталог не найден: {directory}"
+            )
+
+        items = set()
+
+        prefix = directory.rstrip("/")
+
+        if prefix:
+            prefix += "/"
+        else:
+            prefix = "/"
+
+        for path in self.directories:
+            if path == directory:
+                continue
+
+            if path.startswith(prefix):
+                rest = path[len(prefix):]
+
+                if rest and "/" not in rest:
+                    items.add(rest + "/")
+
+        for path in self.files:
+            if path.startswith(prefix):
+                rest = path[len(prefix):]
+
+                if rest and "/" not in rest:
+                    items.add(rest)
+
+        return sorted(items)
 
 
 class ShellEmulator:
@@ -182,6 +266,7 @@ class ShellEmulator:
         )
 
         self.vfs = None
+        self.current_dir = "/"
 
         self.setup_window()
         self.create_widgets()
@@ -199,7 +284,6 @@ class ShellEmulator:
             )
 
     def setup_window(self):
-        """Настроить главное окно."""
         username = getpass.getuser()
         hostname = socket.gethostname()
 
@@ -213,7 +297,6 @@ class ShellEmulator:
         )
 
     def create_widgets(self):
-        """Создать элементы GUI."""
         self.output = scrolledtext.ScrolledText(
             self.root,
             wrap=tk.WORD,
@@ -247,7 +330,6 @@ class ShellEmulator:
         self.entry.focus()
 
     def print_output(self, text):
-        """Вывести текст в окно."""
         self.output.config(
             state=tk.NORMAL
         )
@@ -266,7 +348,6 @@ class ShellEmulator:
         )
 
     def print_configuration(self):
-        """Показать параметры запуска."""
         self.print_output(
             f"VFS: {self.arguments.vfs}"
         )
@@ -280,7 +361,6 @@ class ShellEmulator:
         )
 
     def load_vfs(self):
-        """Загрузить VFS из ZIP."""
         if not self.arguments.vfs:
             return
 
@@ -305,7 +385,6 @@ class ShellEmulator:
             )
 
     def execute_command(self, event=None):
-        """Получить команду из GUI."""
         command_line = (
             self.entry.get().strip()
         )
@@ -323,7 +402,6 @@ class ShellEmulator:
         )
 
     def process_command(self, command_line):
-        """Выполнить одну команду."""
         self.print_output(
             f"> {command_line}"
         )
@@ -360,16 +438,17 @@ class ShellEmulator:
             )
 
     def dispatch_command(self, command, args):
-        """Выполнить поддерживаемую команду."""
         if command == "ls":
-            self.print_output(
-                f"ls: {args}"
-            )
+            self.command_ls(args)
 
         elif command == "cd":
-            self.print_output(
-                f"cd: {args}"
-            )
+            self.command_cd(args)
+
+        elif command == "date":
+            self.command_date(args)
+
+        elif command == "rev":
+            self.command_rev(args)
 
         elif command == "exit":
             self.root.destroy()
@@ -380,8 +459,108 @@ class ShellEmulator:
                 f"'{command}'"
             )
 
+    def require_vfs(self):
+        """Проверить наличие загруженной VFS."""
+        if self.vfs is None:
+            raise ValueError(
+                "VFS не загружена"
+            )
+
+    def command_ls(self, args):
+        """Команда ls."""
+        self.require_vfs()
+
+        if len(args) > 1:
+            raise ValueError(
+                "ls: слишком много аргументов"
+            )
+
+        path = (
+            args[0]
+            if args
+            else self.current_dir
+        )
+
+        target = self.vfs.normalize_path(
+            self.current_dir,
+            path,
+        )
+
+        if target in self.vfs.files:
+            self.print_output(
+                posixpath.basename(target)
+            )
+            return
+
+        items = self.vfs.list_directory(
+            target
+        )
+
+        if items:
+            self.print_output(
+                "  ".join(items)
+            )
+        else:
+            self.print_output(
+                "(пусто)"
+            )
+
+    def command_cd(self, args):
+        """Команда cd."""
+        self.require_vfs()
+
+        if len(args) != 1:
+            raise ValueError(
+                "cd: требуется один аргумент"
+            )
+
+        target = self.vfs.normalize_path(
+            self.current_dir,
+            args[0],
+        )
+
+        if target not in self.vfs.directories:
+            raise ValueError(
+                f"cd: каталог не найден: "
+                f"{args[0]}"
+            )
+
+        self.current_dir = target
+
+        self.print_output(
+            f"Текущий каталог: "
+            f"{self.current_dir}"
+        )
+
+    def command_date(self, args):
+        """Команда date."""
+        if args:
+            raise ValueError(
+                "date: аргументы не поддерживаются"
+            )
+
+        now = datetime.now()
+
+        self.print_output(
+            now.strftime(
+                "%d.%m.%Y %H:%M:%S"
+            )
+        )
+
+    def command_rev(self, args):
+        """Команда rev."""
+        if not args:
+            raise ValueError(
+                "rev: укажите текст"
+            )
+
+        text = " ".join(args)
+
+        self.print_output(
+            text[::-1]
+        )
+
     def run_startup_script(self, script_path):
-        """Выполнить стартовый скрипт."""
         path = Path(script_path)
 
         if not path.exists():
@@ -404,12 +583,6 @@ class ShellEmulator:
             )
             return
 
-        self.run_script_lines(
-            lines
-        )
-
-    def run_script_lines(self, lines):
-        """Выполнить строки стартового скрипта."""
         for line in lines:
             stripped = line.strip()
 
@@ -425,7 +598,6 @@ class ShellEmulator:
 
 
 def main():
-    """Запустить программу."""
     arguments = parse_arguments()
 
     root = tk.Tk()
