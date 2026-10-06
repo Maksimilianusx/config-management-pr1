@@ -1,0 +1,16 @@
+# Проверка Этапа 5
+
+ls
+touch newfile.txt
+ls
+
+cd level1
+touch test1.txt
+ls
+
+cd level2
+touch test2.txt
+ls
+
+touch
+touch one two

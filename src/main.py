@@ -189,7 +189,7 @@ class VirtualFileSystem:
                 )
 
     def add_directories(self, path):
-        """Добавить директории в список VFS."""
+        """Добавить директории в VFS."""
         path = "/" + path.strip("/")
 
         while path not in ("", "/"):
@@ -226,7 +226,6 @@ class VirtualFileSystem:
             )
 
         items = set()
-
         prefix = directory.rstrip("/")
 
         if prefix:
@@ -252,6 +251,27 @@ class VirtualFileSystem:
                     items.add(rest)
 
         return sorted(items)
+
+    def touch(self, current_dir, path):
+        """Создать пустой файл только в памяти."""
+        target = self.normalize_path(
+            current_dir,
+            path,
+        )
+
+        parent = posixpath.dirname(target)
+
+        if parent not in self.directories:
+            raise ValueError(
+                f"touch: каталог не найден: {parent}"
+            )
+
+        if target in self.directories:
+            raise ValueError(
+                f"touch: это каталог: {path}"
+            )
+
+        self.files[target] = b""
 
 
 class ShellEmulator:
@@ -288,8 +308,7 @@ class ShellEmulator:
         hostname = socket.gethostname()
 
         self.root.title(
-            f"Эмулятор - "
-            f"[{username}@{hostname}]"
+            f"Эмулятор - [{username}@{hostname}]"
         )
 
         self.root.geometry(
@@ -372,16 +391,14 @@ class ShellEmulator:
             self.vfs.load()
 
             self.print_output(
-                "VFS загружена: "
-                f"{self.arguments.vfs}"
+                f"VFS загружена: {self.arguments.vfs}"
             )
 
         except Exception as error:
             self.vfs = None
 
             self.print_output(
-                "Ошибка загрузки VFS: "
-                f"{error}"
+                f"Ошибка загрузки VFS: {error}"
             )
 
     def execute_command(self, event=None):
@@ -450,24 +467,24 @@ class ShellEmulator:
         elif command == "rev":
             self.command_rev(args)
 
+        elif command == "touch":
+            self.command_touch(args)
+
         elif command == "exit":
             self.root.destroy()
 
         else:
             raise ValueError(
-                f"неизвестная команда "
-                f"'{command}'"
+                f"неизвестная команда '{command}'"
             )
 
     def require_vfs(self):
-        """Проверить наличие загруженной VFS."""
         if self.vfs is None:
             raise ValueError(
                 "VFS не загружена"
             )
 
     def command_ls(self, args):
-        """Команда ls."""
         self.require_vfs()
 
         if len(args) > 1:
@@ -506,7 +523,6 @@ class ShellEmulator:
             )
 
     def command_cd(self, args):
-        """Команда cd."""
         self.require_vfs()
 
         if len(args) != 1:
@@ -521,19 +537,16 @@ class ShellEmulator:
 
         if target not in self.vfs.directories:
             raise ValueError(
-                f"cd: каталог не найден: "
-                f"{args[0]}"
+                f"cd: каталог не найден: {args[0]}"
             )
 
         self.current_dir = target
 
         self.print_output(
-            f"Текущий каталог: "
-            f"{self.current_dir}"
+            f"Текущий каталог: {self.current_dir}"
         )
 
     def command_date(self, args):
-        """Команда date."""
         if args:
             raise ValueError(
                 "date: аргументы не поддерживаются"
@@ -548,7 +561,6 @@ class ShellEmulator:
         )
 
     def command_rev(self, args):
-        """Команда rev."""
         if not args:
             raise ValueError(
                 "rev: укажите текст"
@@ -560,14 +572,30 @@ class ShellEmulator:
             text[::-1]
         )
 
+    def command_touch(self, args):
+        self.require_vfs()
+
+        if len(args) != 1:
+            raise ValueError(
+                "touch: требуется один аргумент"
+            )
+
+        self.vfs.touch(
+            self.current_dir,
+            args[0],
+        )
+
+        self.print_output(
+            f"Файл создан: {args[0]}"
+        )
+
     def run_startup_script(self, script_path):
         path = Path(script_path)
 
         if not path.exists():
             self.print_output(
-                "Ошибка стартового скрипта: "
-                f"файл '{script_path}' "
-                "не найден"
+                f"Ошибка стартового скрипта: "
+                f"файл '{script_path}' не найден"
             )
             return
 
@@ -578,8 +606,7 @@ class ShellEmulator:
 
         except OSError as error:
             self.print_output(
-                "Ошибка стартового скрипта: "
-                f"{error}"
+                f"Ошибка стартового скрипта: {error}"
             )
             return
 
