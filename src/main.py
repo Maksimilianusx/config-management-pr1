@@ -14,67 +14,37 @@ from tkinter import scrolledtext
 
 
 def expand_environment(command_line):
-    """Раскрыть переменные окружения."""
+    """Раскрыть переменные окружения реальной ОС."""
     if "HOME" not in os.environ:
-        os.environ["HOME"] = os.environ.get(
-            "USERPROFILE",
-            "",
-        )
-
+        os.environ["HOME"] = os.environ.get("USERPROFILE", "")
     return os.path.expandvars(command_line)
 
 
 def parse_command(command_line):
     """Разобрать командную строку."""
-    expanded_line = expand_environment(
-        command_line
-    )
-
+    expanded_line = expand_environment(command_line)
     try:
-        return shlex.split(
-            expanded_line,
-            posix=False,
-        )
+        return shlex.split(expanded_line, posix=False)
     except ValueError as error:
-        raise ValueError(
-            f"ошибка разбора команды: {error}"
-        ) from error
+        raise ValueError(f"ошибка разбора команды: {error}") from error
 
 
 def parse_arguments():
-    """Получить параметры запуска."""
-    parser = argparse.ArgumentParser(
-        description="Эмулятор оболочки ОС"
-    )
-
-    parser.add_argument(
-        "--vfs",
-        default="",
-        help="Путь к ZIP-архиву VFS",
-    )
-
-    parser.add_argument(
-        "--log",
-        default="logs/log.xml",
-        help="Путь к XML-файлу журнала",
-    )
-
-    parser.add_argument(
-        "--script",
-        default="",
-        help="Путь к стартовому скрипту",
-    )
-
+    """Получить параметры запуска программы."""
+    parser = argparse.ArgumentParser(description="Эмулятор оболочки ОС")
+    parser.add_argument("--vfs", required=True)
+    parser.add_argument("--log", default="logs/log.xml")
+    parser.add_argument("--script", default="")
     return parser.parse_args()
 
 
 class XmlLogger:
-    """XML-журнал выполнения команд."""
+    """XML-журнал событий выполнения команд."""
 
     def __init__(self, log_path):
         self.log_path = Path(log_path)
 
-    def load_tree(self):
+    def _load_tree(self):
         if not self.log_path.exists():
             root = element_tree.Element("log")
             return element_tree.ElementTree(root)
@@ -86,21 +56,17 @@ class XmlLogger:
             return element_tree.ElementTree(root)
 
     def write(self, command, error=""):
-        self.log_path.parent.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
-
-        tree = self.load_tree()
+        self.log_path.parent.mkdir(parents=True, exist_ok=True)
+        tree = self._load_tree()
         root = tree.getroot()
 
-        self._append_event(root, command, error)
+        event = element_tree.SubElement(root, "event")
+        now = datetime.now().isoformat(timespec="seconds")
+        element_tree.SubElement(event, "datetime").text = now
+        element_tree.SubElement(event, "command").text = command
+        element_tree.SubElement(event, "error").text = error
 
-        element_tree.indent(
-            tree,
-            space="    ",
-        )
-
+        element_tree.indent(tree, space="    ")
         tree.write(
             self.log_path,
             encoding="utf-8",
@@ -108,148 +74,155 @@ class XmlLogger:
         )
 
 
-    @staticmethod
-    def _append_event(root, command, error):
-        """Добавить запись о выполненной команде."""
-        event = element_tree.SubElement(
-            root,
-            "event",
-        )
-
-        element_tree.SubElement(
-            event,
-            "datetime",
-        ).text = datetime.now().isoformat(
-            timespec="seconds"
-        )
-
-        element_tree.SubElement(
-            event,
-            "command",
-        ).text = command
-
-        element_tree.SubElement(
-            event,
-            "error",
-        ).text = error
-
 class VirtualFileSystem:
-    """Виртуальная файловая система из ZIP."""
+    """ZIP-VFS, загружаемая и изменяемая только в памяти."""
 
     def __init__(self, zip_path):
-        self.zip_path = zip_path
+        self.zip_path = Path(zip_path)
         self.files = {}
+        self.modified = {}
         self.directories = {"/"}
+        self.cwd = "/"
+        self._load_zip()
 
-    def load(self):
-        """Загрузить VFS в память."""
-        if not self.zip_path:
+    def _load_zip(self):
+        self._validate_zip()
+        with zipfile.ZipFile(self.zip_path, "r") as archive:
+            for info in archive.infolist():
+                self._load_entry(archive, info)
+
+    def _validate_zip(self):
+        if not self.zip_path.exists():
+            raise ValueError(f"VFS-файл '{self.zip_path}' не найден")
+        if not zipfile.is_zipfile(self.zip_path):
             raise ValueError(
-                "путь к VFS не указан"
+                f"VFS-файл '{self.zip_path}' имеет неверный формат"
             )
 
-        if not os.path.exists(self.zip_path):
-            raise FileNotFoundError(
-                f"VFS не найдена: {self.zip_path}"
-            )
+    def _load_entry(self, archive, info):
+        raw_name = info.filename.replace("\\", "/").strip("/")
+        if not raw_name:
+            return
 
-        try:
-            self.read_archive()
-        except zipfile.BadZipFile as error:
-            raise ValueError(
-                "неверный формат VFS"
-            ) from error
+        full_path = "/" + raw_name
+        if info.is_dir() or info.filename.endswith("/"):
+            self._add_directory(full_path)
+            return
 
-    def read_archive(self):
-        """Прочитать ZIP без распаковки."""
-        with zipfile.ZipFile(
-            self.zip_path,
-            "r",
-        ) as archive:
-            for name in archive.namelist():
-                clean_name = name.replace(
-                    "\\",
-                    "/",
-                ).strip("/")
+        parent = posixpath.dirname(full_path) or "/"
+        self._add_directory(parent)
+        self.files[full_path] = archive.read(info.filename)
+        self.modified[full_path] = datetime(*info.date_time)
 
-                if not clean_name:
-                    continue
+    def _add_directory(self, path):
+        current = self._normalize(path)
+        while True:
+            self.directories.add(current)
+            if current == "/":
+                return
+            current = posixpath.dirname(current) or "/"
 
-                if name.endswith("/"):
-                    self.add_directories(
-                        clean_name
-                    )
-                    continue
+    def _normalize(self, path):
+        if path is None or path == "":
+            return self.cwd
 
-                self.files[
-                    "/" + clean_name
-                ] = archive.read(name)
-
-                parent = posixpath.dirname(
-                    "/" + clean_name
-                )
-
-                self.add_directories(
-                    parent
-                )
-
-    def add_directories(self, path):
-        """Добавить директории в список VFS."""
-        path = "/" + path.strip("/")
-
-        while path not in ("", "/"):
-            self.directories.add(path)
-            path = posixpath.dirname(path)
-
-        self.directories.add("/")
-
-    def normalize_path(self, current_dir, path):
-        """Получить абсолютный путь внутри VFS."""
-        if not path:
-            return current_dir
-
-        if path.startswith("/"):
-            result = posixpath.normpath(path)
+        clean_path = path.replace("\\", "/")
+        if clean_path.startswith("/"):
+            combined = clean_path
         else:
-            result = posixpath.normpath(
-                posixpath.join(
-                    current_dir,
-                    path,
-                )
+            combined = posixpath.join(self.cwd, clean_path)
+
+        normalized = posixpath.normpath(combined)
+        if normalized.startswith("/"):
+            return normalized
+        return "/" + normalized
+
+    def list_dir(self, path=""):
+        target = self._normalize(path)
+        self._ensure_list_target(target, path)
+
+        if target in self.files:
+            return [posixpath.basename(target)]
+
+        return self._collect_children(target)
+
+    def list_long(self, path=""):
+        """Подробный список элементов с метаданными виртуальной ФС."""
+        base = self._normalize(path)
+        items = self.list_dir(path)
+        rows = []
+        for item in items:
+            full_path = base if base in self.files else posixpath.join(
+                base, item.rstrip("/")
             )
+            rows.append(self._long_entry(full_path, item))
+        return rows
 
-        if not result.startswith("/"):
-            result = "/" + result
+    def _long_entry(self, path, name):
+        is_dir = path in self.directories
+        permissions = "drwxr-xr-x" if is_dir else "-rw-r--r--"
+        size = 0 if is_dir else len(self.files[path])
+        timestamp = self._entry_time(path).strftime("%b %d %H:%M")
+        return f"{permissions} 1 vfs vfs {size:>7} {timestamp} {name}"
 
-        return result
+    def _entry_time(self, path):
+        if path in self.modified:
+            return self.modified[path]
+        prefix = path.rstrip("/") + "/"
+        dates = [date for filename, date in self.modified.items()
+                 if filename.startswith(prefix)]
+        return max(dates, default=datetime(1980, 1, 1))
 
-    def list_directory(self, directory):
-        """Получить содержимое каталога."""
-        if directory not in self.directories:
-            raise ValueError(
-                f"каталог не найден: {directory}"
-            )
+    def _ensure_list_target(self, target, original):
+        if target not in self.directories and target not in self.files:
+            raise ValueError(f"ls: '{original}' не найден")
 
-        prefix = directory.rstrip("/") + "/"
-        directories = self._direct_children(
-            self.directories, prefix, "/"
-        )
-        files = self._direct_children(
-            self.files, prefix, ""
-        )
-        return sorted(directories | files)
+    def _collect_children(self, target):
+        children = set()
+
+        for directory in self.directories:
+            if self._is_direct_child(directory, target):
+                children.add(posixpath.basename(directory) + "/")
+
+        for file_path in self.files:
+            if self._is_direct_child(file_path, target):
+                children.add(posixpath.basename(file_path))
+
+        return sorted(children, key=str.lower)
 
     @staticmethod
-    def _direct_children(paths, prefix, suffix):
-        """Вернуть имена непосредственно вложенных объектов."""
-        names = set()
-        for path in paths:
-            if not path.startswith(prefix):
-                continue
-            rest = path[len(prefix):]
-            if rest and "/" not in rest:
-                names.add(rest + suffix)
-        return names
+    def _is_direct_child(path, parent):
+        if path == parent:
+            return False
+        path_parent = posixpath.dirname(path) or "/"
+        return path_parent == parent
+
+    def change_dir(self, path):
+        target = self._normalize(path)
+        if target not in self.directories:
+            raise ValueError(f"cd: каталог '{path}' не найден")
+        self.cwd = target
+
+    def touch(self, path):
+        target = self._prepare_touch_path(path)
+        if target not in self.files:
+            self.files[target] = b""
+        self.modified[target] = datetime.now()
+
+    def _prepare_touch_path(self, path):
+        if not path:
+            raise ValueError("touch: не указано имя файла")
+
+        target = self._normalize(path)
+        parent = posixpath.dirname(target) or "/"
+
+        if parent not in self.directories:
+            raise ValueError(
+                f"touch: родительский каталог '{parent}' не найден"
+            )
+        if target in self.directories:
+            raise ValueError(f"touch: '{path}' является каталогом")
+        return target
 
 
 class ShellEmulator:
@@ -258,50 +231,25 @@ class ShellEmulator:
     def __init__(self, root, arguments):
         self.root = root
         self.arguments = arguments
-
-        self.logger = XmlLogger(
-            arguments.log
-        )
-
+        self.logger = XmlLogger(arguments.log)
         self.vfs = None
-        self.current_dir = "/"
+        self._configure_window()
+        self._create_widgets()
+        self._start_emulator()
 
-        self.setup_window()
-        self.create_widgets()
-
-        self.print_output(
-            "Shell emulator started."
-        )
-
-        self.print_configuration()
-        self.load_vfs()
-
-        if self.arguments.script:
-            self.run_startup_script(
-                self.arguments.script
-            )
-
-    def setup_window(self):
+    def _configure_window(self):
         username = getpass.getuser()
         hostname = socket.gethostname()
+        self.root.title(f"Эмулятор - [{username}@{hostname}]")
+        self.root.geometry("800x500")
 
-        self.root.title(
-            f"Эмулятор - "
-            f"[{username}@{hostname}]"
-        )
-
-        self.root.geometry(
-            "800x500"
-        )
-
-    def create_widgets(self):
+    def _create_widgets(self):
         self.output = scrolledtext.ScrolledText(
             self.root,
             wrap=tk.WORD,
             font=("Consolas", 11),
             state=tk.DISABLED,
         )
-
         self.output.pack(
             fill=tk.BOTH,
             expand=True,
@@ -309,302 +257,155 @@ class ShellEmulator:
             pady=10,
         )
 
-        self.entry = tk.Entry(
-            self.root,
-            font=("Consolas", 11),
-        )
-
-        self.entry.pack(
-            fill=tk.X,
-            padx=10,
-            pady=(0, 10),
-        )
-
-        self.entry.bind(
-            "<Return>",
-            self.execute_command,
-        )
-
+        self.entry = tk.Entry(self.root, font=("Consolas", 11))
+        self.entry.pack(fill=tk.X, padx=10, pady=(0, 10))
+        self.entry.bind("<Return>", self.execute_command)
         self.entry.focus()
 
-    def print_output(self, text):
-        self.output.config(
-            state=tk.NORMAL
-        )
-
-        self.output.insert(
-            tk.END,
-            text + "\n",
-        )
-
-        self.output.see(
-            tk.END
-        )
-
-        self.output.config(
-            state=tk.DISABLED
-        )
-
-    def print_configuration(self):
-        self.print_output(
-            f"VFS: {self.arguments.vfs}"
-        )
-
-        self.print_output(
-            f"LOG: {self.arguments.log}"
-        )
-
-        self.print_output(
-            f"SCRIPT: {self.arguments.script}"
-        )
-
-    def load_vfs(self):
-        if not self.arguments.vfs:
-            return
+    def _start_emulator(self):
+        self.print_output("Shell emulator started.")
+        self._print_configuration()
 
         try:
-            self.vfs = VirtualFileSystem(
-                self.arguments.vfs
-            )
-
-            self.vfs.load()
-
-            self.print_output(
-                "VFS загружена: "
-                f"{self.arguments.vfs}"
-            )
-
-        except Exception as error:
-            self.vfs = None
-
-            self.print_output(
-                "Ошибка загрузки VFS: "
-                f"{error}"
-            )
-
-    def execute_command(self, event=None):
-        command_line = (
-            self.entry.get().strip()
-        )
-
-        self.entry.delete(
-            0,
-            tk.END,
-        )
-
-        if not command_line:
+            self.vfs = VirtualFileSystem(self.arguments.vfs)
+        except ValueError as error:
+            self.print_output(f"Ошибка загрузки VFS: {error}")
+            self.entry.config(state=tk.DISABLED)
             return
 
-        self.process_command(
-            command_line
-        )
+        self.print_output("VFS loaded successfully.")
+        if self.arguments.script:
+            self.run_startup_script(self.arguments.script)
+
+    def _print_configuration(self):
+        self.print_output(f"VFS: {self.arguments.vfs}")
+        self.print_output(f"LOG: {self.arguments.log}")
+        self.print_output(f"SCRIPT: {self.arguments.script}")
+
+    def print_output(self, text):
+        self.output.config(state=tk.NORMAL)
+        self.output.insert(tk.END, text + "\n")
+        self.output.see(tk.END)
+        self.output.config(state=tk.DISABLED)
+
+    def execute_command(self, event=None):
+        command_line = self.entry.get().strip()
+        self.entry.delete(0, tk.END)
+        if command_line:
+            self.process_command(command_line)
 
     def process_command(self, command_line):
-        self.print_output(
-            f"> {command_line}"
-        )
-
+        self.print_output(f"> {command_line}")
         error_message = ""
 
         try:
-            parts = parse_command(
-                command_line
-            )
-
-            if not parts:
-                return
-
-            command = parts[0]
-            args = parts[1:]
-
-            self.dispatch_command(
-                command,
-                args,
-            )
-
-        except Exception as error:
+            parts = parse_command(command_line)
+            if parts:
+                self._dispatch(parts[0], parts[1:])
+        except (ValueError, OSError) as error:
             error_message = str(error)
-
-            self.print_output(
-                f"Ошибка: {error_message}"
-            )
-
+            self.print_output(f"Ошибка: {error_message}")
         finally:
-            self.logger.write(
-                command_line,
-                error_message,
-            )
+            self.logger.write(command_line, error_message)
 
-    def dispatch_command(self, command, args):
-        if command == "ls":
-            self.command_ls(args)
+    def _dispatch(self, command, args):
+        commands = {
+            "ls": self._command_ls,
+            "cd": self._command_cd,
+            "date": self._command_date,
+            "rev": self._command_rev,
+            "touch": self._command_touch,
+            "exit": self._command_exit,
+        }
 
-        elif command == "cd":
-            self.command_cd(args)
+        handler = commands.get(command)
+        if handler is None:
+            raise ValueError(f"неизвестная команда '{command}'")
+        handler(args)
 
-        elif command == "date":
-            self.command_date(args)
-
-        elif command == "rev":
-            self.command_rev(args)
-
-        elif command == "exit":
-            self.root.destroy()
-
-        else:
-            raise ValueError(
-                f"неизвестная команда "
-                f"'{command}'"
-            )
-
-    def require_vfs(self):
-        """Проверить наличие загруженной VFS."""
-        if self.vfs is None:
-            raise ValueError(
-                "VFS не загружена"
-            )
-
-    def command_ls(self, args):
-        """Команда ls."""
-        self.require_vfs()
-
-        if len(args) > 1:
-            raise ValueError(
-                "ls: слишком много аргументов"
-            )
-
-        path = (
-            args[0]
-            if args
-            else self.current_dir
-        )
-
-        target = self.vfs.normalize_path(
-            self.current_dir,
-            path,
-        )
-
-        if target in self.vfs.files:
-            self.print_output(
-                posixpath.basename(target)
-            )
+    def _command_ls(self, args):
+        mode, path = self._parse_ls_args(args)
+        if mode == "-l":
+            lines = self.vfs.list_long(path)
+            self.print_output("\n".join(lines))
             return
 
-        items = self.vfs.list_directory(
-            target
-        )
+        items = self.vfs.list_dir(path)
+        separator = "\n" if mode == "-1" else "  "
+        self.print_output(separator.join(items))
 
-        if items:
-            self.print_output(
-                "  ".join(items)
-            )
-        else:
-            self.print_output(
-                "(пусто)"
-            )
+    @staticmethod
+    def _parse_ls_args(args):
+        """Поддержать ls, ls -1, ls -l и необязательный путь."""
+        option = ""
+        path = ""
+        for item in args:
+            if item.startswith("-"):
+                if item not in ("-1", "-l") or option:
+                    raise ValueError(f"ls: неизвестный параметр '{item}'")
+                option = item
+            elif path:
+                raise ValueError("ls: слишком много аргументов")
+            else:
+                path = item
+        return option, path
 
-    def command_cd(self, args):
-        """Команда cd."""
-        self.require_vfs()
-
+    def _command_cd(self, args):
         if len(args) != 1:
-            raise ValueError(
-                "cd: требуется один аргумент"
-            )
+            raise ValueError("cd: требуется ровно один аргумент")
+        self.vfs.change_dir(args[0])
 
-        target = self.vfs.normalize_path(
-            self.current_dir,
-            args[0],
-        )
-
-        if target not in self.vfs.directories:
-            raise ValueError(
-                f"cd: каталог не найден: "
-                f"{args[0]}"
-            )
-
-        self.current_dir = target
-
-        self.print_output(
-            f"Текущий каталог: "
-            f"{self.current_dir}"
-        )
-
-    def command_date(self, args):
-        """Команда date."""
+    def _command_date(self, args):
         if args:
-            raise ValueError(
-                "date: аргументы не поддерживаются"
-            )
+            raise ValueError("date: команда не принимает аргументы")
+        value = datetime.now().strftime("%a %b %d %H:%M:%S %Y")
+        self.print_output(value)
 
-        now = datetime.now()
-
-        self.print_output(
-            now.strftime(
-                "%d.%m.%Y %H:%M:%S"
-            )
-        )
-
-    def command_rev(self, args):
-        """Команда rev."""
+    def _command_rev(self, args):
         if not args:
-            raise ValueError(
-                "rev: укажите текст"
-            )
+            raise ValueError("rev: укажите строку")
+        self.print_output(" ".join(args)[::-1])
 
-        text = " ".join(args)
+    def _command_touch(self, args):
+        if len(args) != 1:
+            raise ValueError("touch: требуется ровно один аргумент")
+        self.vfs.touch(args[0])
 
-        self.print_output(
-            text[::-1]
-        )
+    def _command_exit(self, args):
+        if args:
+            raise ValueError("exit: команда не принимает аргументы")
+        self.root.destroy()
 
     def run_startup_script(self, script_path):
         path = Path(script_path)
-
-        if not path.exists():
-            self.print_output(
-                "Ошибка стартового скрипта: "
-                f"файл '{script_path}' "
-                "не найден"
-            )
-            return
-
-        try:
-            lines = path.read_text(
-                encoding="utf-8"
-            ).splitlines()
-
-        except OSError as error:
-            self.print_output(
-                "Ошибка стартового скрипта: "
-                f"{error}"
-            )
-            return
+        lines = self._read_script(path, script_path)
 
         for line in lines:
             stripped = line.strip()
+            if stripped and not stripped.startswith("#"):
+                self.process_command(stripped)
 
-            if not stripped:
-                continue
-
-            if stripped.startswith("#"):
-                continue
-
-            self.process_command(
-                stripped
+    def _read_script(self, path, script_path):
+        if not path.exists():
+            self.print_output(
+                f"Ошибка стартового скрипта: "
+                f"файл '{script_path}' не найден"
             )
+            return []
+
+        try:
+            return path.read_text(encoding="utf-8").splitlines()
+        except OSError as error:
+            self.print_output(
+                f"Ошибка стартового скрипта: {error}"
+            )
+            return []
 
 
 def main():
     arguments = parse_arguments()
-
     root = tk.Tk()
-
-    ShellEmulator(
-        root,
-        arguments,
-    )
-
+    ShellEmulator(root, arguments)
     root.mainloop()
 
 
