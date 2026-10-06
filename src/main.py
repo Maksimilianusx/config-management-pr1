@@ -4,7 +4,8 @@ import os
 import shlex
 import socket
 import tkinter as tk
-import xml.etree.ElementTree as ET
+import xml.etree.ElementTree as element_tree
+import zipfile
 
 from datetime import datetime
 from pathlib import Path
@@ -14,17 +15,25 @@ from tkinter import scrolledtext
 def expand_environment(command_line):
     """Раскрыть переменные окружения."""
     if "HOME" not in os.environ:
-        os.environ["HOME"] = os.environ.get("USERPROFILE", "")
+        os.environ["HOME"] = os.environ.get(
+            "USERPROFILE",
+            "",
+        )
 
     return os.path.expandvars(command_line)
 
 
 def parse_command(command_line):
     """Разобрать командную строку."""
-    expanded_line = expand_environment(command_line)
+    expanded_line = expand_environment(
+        command_line
+    )
 
     try:
-        return shlex.split(expanded_line, posix=False)
+        return shlex.split(
+            expanded_line,
+            posix=False,
+        )
     except ValueError as error:
         raise ValueError(
             f"ошибка разбора команды: {error}"
@@ -40,7 +49,7 @@ def parse_arguments():
     parser.add_argument(
         "--vfs",
         default="",
-        help="Путь к физическому расположению VFS",
+        help="Путь к ZIP-архиву VFS",
     )
 
     parser.add_argument(
@@ -64,47 +73,31 @@ class XmlLogger:
     def __init__(self, log_path):
         self.log_path = Path(log_path)
 
+    def load_tree(self):
+        """Загрузить существующий XML или создать новый."""
+        if not self.log_path.exists():
+            root = element_tree.Element("log")
+            return element_tree.ElementTree(root)
+
+        try:
+            return element_tree.parse(self.log_path)
+        except element_tree.ParseError:
+            root = element_tree.Element("log")
+            return element_tree.ElementTree(root)
+
     def write(self, command, error=""):
-        """Записать событие в XML-файл."""
+        """Записать событие в XML."""
         self.log_path.parent.mkdir(
             parents=True,
             exist_ok=True,
         )
 
-        if self.log_path.exists():
-            try:
-                tree = ET.parse(self.log_path)
-                root = tree.getroot()
-            except ET.ParseError:
-                root = ET.Element("log")
-                tree = ET.ElementTree(root)
-        else:
-            root = ET.Element("log")
-            tree = ET.ElementTree(root)
+        tree = self.load_tree()
+        root = tree.getroot()
 
-        event = ET.SubElement(
-            root,
-            "event",
-        )
+        self._append_event(root, command, error)
 
-        ET.SubElement(
-            event,
-            "datetime",
-        ).text = datetime.now().isoformat(
-            timespec="seconds"
-        )
-
-        ET.SubElement(
-            event,
-            "command",
-        ).text = command
-
-        ET.SubElement(
-            event,
-            "error",
-        ).text = error
-
-        ET.indent(
+        element_tree.indent(
             tree,
             space="    ",
         )
@@ -116,22 +109,86 @@ class XmlLogger:
         )
 
 
+    @staticmethod
+    def _append_event(root, command, error):
+        """Добавить запись о выполненной команде."""
+        event = element_tree.SubElement(
+            root,
+            "event",
+        )
+
+        element_tree.SubElement(
+            event,
+            "datetime",
+        ).text = datetime.now().isoformat(
+            timespec="seconds"
+        )
+
+        element_tree.SubElement(
+            event,
+            "command",
+        ).text = command
+
+        element_tree.SubElement(
+            event,
+            "error",
+        ).text = error
+
+class VirtualFileSystem:
+    """Виртуальная файловая система из ZIP."""
+
+    def __init__(self, zip_path):
+        self.zip_path = zip_path
+        self.files = {}
+
+    def load(self):
+        """Загрузить файлы ZIP в память."""
+        if not self.zip_path:
+            raise ValueError(
+                "путь к VFS не указан"
+            )
+
+        if not os.path.exists(self.zip_path):
+            raise FileNotFoundError(
+                f"VFS не найдена: {self.zip_path}"
+            )
+
+        try:
+            self.read_archive()
+        except zipfile.BadZipFile as error:
+            raise ValueError(
+                "неверный формат VFS"
+            ) from error
+
+    def read_archive(self):
+        """Прочитать содержимое ZIP без распаковки."""
+        with zipfile.ZipFile(
+            self.zip_path,
+            "r",
+        ) as archive:
+            for name in archive.namelist():
+                if name.endswith("/"):
+                    continue
+
+                self.files[name] = archive.read(
+                    name
+                )
+
+
 class ShellEmulator:
     """Графический эмулятор оболочки."""
 
     def __init__(self, root, arguments):
         self.root = root
         self.arguments = arguments
-        self.logger = XmlLogger(arguments.log)
 
-        username = getpass.getuser()
-        hostname = socket.gethostname()
-
-        self.root.title(
-            f"Эмулятор - [{username}@{hostname}]"
+        self.logger = XmlLogger(
+            arguments.log
         )
-        self.root.geometry("800x500")
 
+        self.vfs = None
+
+        self.setup_window()
         self.create_widgets()
 
         self.print_output(
@@ -139,14 +196,29 @@ class ShellEmulator:
         )
 
         self.print_configuration()
+        self.load_vfs()
 
         if self.arguments.script:
             self.run_startup_script(
                 self.arguments.script
             )
 
+    def setup_window(self):
+        """Настроить главное окно."""
+        username = getpass.getuser()
+        hostname = socket.gethostname()
+
+        self.root.title(
+            f"Эмулятор - "
+            f"[{username}@{hostname}]"
+        )
+
+        self.root.geometry(
+            "800x500"
+        )
+
     def create_widgets(self):
-        """Создать GUI."""
+        """Создать элементы GUI."""
         self.output = scrolledtext.ScrolledText(
             self.root,
             wrap=tk.WORD,
@@ -187,7 +259,7 @@ class ShellEmulator:
 
         self.output.insert(
             tk.END,
-            text + "\n"
+            text + "\n",
         )
 
         self.output.see(
@@ -199,7 +271,7 @@ class ShellEmulator:
         )
 
     def print_configuration(self):
-        """Отладочный вывод параметров запуска."""
+        """Показать параметры запуска."""
         self.print_output(
             f"VFS: {self.arguments.vfs}"
         )
@@ -212,9 +284,36 @@ class ShellEmulator:
             f"SCRIPT: {self.arguments.script}"
         )
 
+    def load_vfs(self):
+        """Загрузить VFS из ZIP."""
+        if not self.arguments.vfs:
+            return
+
+        try:
+            self.vfs = VirtualFileSystem(
+                self.arguments.vfs
+            )
+
+            self.vfs.load()
+
+            self.print_output(
+                "VFS загружена: "
+                f"{self.arguments.vfs}"
+            )
+
+        except Exception as error:
+            self.vfs = None
+
+            self.print_output(
+                "Ошибка загрузки VFS: "
+                f"{error}"
+            )
+
     def execute_command(self, event=None):
-        """Обработать команду из GUI."""
-        command_line = self.entry.get().strip()
+        """Получить команду из GUI."""
+        command_line = (
+            self.entry.get().strip()
+        )
 
         self.entry.delete(
             0,
@@ -252,13 +351,6 @@ class ShellEmulator:
                 args,
             )
 
-        except ValueError as error:
-            error_message = str(error)
-
-            self.print_output(
-                f"Ошибка: {error_message}"
-            )
-
         except Exception as error:
             error_message = str(error)
 
@@ -289,7 +381,8 @@ class ShellEmulator:
 
         else:
             raise ValueError(
-                f"неизвестная команда '{command}'"
+                f"неизвестная команда "
+                f"'{command}'"
             )
 
     def run_startup_script(self, script_path):
@@ -298,8 +391,9 @@ class ShellEmulator:
 
         if not path.exists():
             self.print_output(
-                f"Ошибка стартового скрипта: "
-                f"файл '{script_path}' не найден"
+                "Ошибка стартового скрипта: "
+                f"файл '{script_path}' "
+                "не найден"
             )
             return
 
@@ -310,10 +404,17 @@ class ShellEmulator:
 
         except OSError as error:
             self.print_output(
-                f"Ошибка стартового скрипта: {error}"
+                "Ошибка стартового скрипта: "
+                f"{error}"
             )
             return
 
+        self.run_script_lines(
+            lines
+        )
+
+    def run_script_lines(self, lines):
+        """Выполнить строки стартового скрипта."""
         for line in lines:
             stripped = line.strip()
 
