@@ -1,0 +1,19 @@
+# Проверка Этапа 4
+
+ls
+cd level1
+ls
+cd level2
+ls
+cd level3
+ls
+cd ..
+ls
+
+date
+
+rev hello
+rev hello world
+
+cd missing
+abc
