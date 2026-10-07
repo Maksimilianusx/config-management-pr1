@@ -6,4 +6,6 @@ __pycache__/
 venv/
 .idea/
 .vscode/
+logs/*.zip
 logs/
+temp_vfs/
